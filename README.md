@@ -1,6 +1,6 @@
 # YouTube Movie Ratings
 
-A Chrome extension that displays IMDb, Rotten Tomatoes, and Metacritic ratings directly on YouTube movie cards.
+A Chrome extension that displays IMDb, Rotten Tomatoes, and Metacritic ratings directly on YouTube movie cards. Also gives a recommendation of movies based on what you've watched
 
 ## Features
 
