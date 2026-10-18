@@ -1,0 +1,61 @@
+/* Rating badges injected into YouTube movie cards. Everything is prefixed with
+   "ymr-" so it can't collide with YouTube's own class names. */
+
+.ymr-ratings {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+  font-family: Roboto, Arial, sans-serif;
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.ymr-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 6px;
+  border-radius: 4px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.ymr-label {
+  font-weight: 700;
+}
+
+.ymr-imdb {
+  background: #f5c518;
+  color: #000;
+}
+
+.ymr-rt-fresh {
+  background: #fa320a;
+  color: #fff;
+}
+
+.ymr-rt-rotten {
+  background: #0ac855;
+  color: #000;
+}
+
+.ymr-mc-good {
+  background: #66cc33;
+  color: #000;
+}
+
+.ymr-mc-mixed {
+  background: #ffcc33;
+  color: #000;
+}
+
+.ymr-mc-bad {
+  background: #ff0000;
+  color: #fff;
+}
+
+/* YouTube's own variable, so it follows light/dark theme automatically. */
+.ymr-note {
+  color: var(--yt-spec-text-secondary, #606060);
+}

@@ -8,6 +8,10 @@ export default defineConfig({
     description: 'A extension to show movie ratings on Youtube.',
     version: '1.0.0',
     permissions: ["storage"],
-    host_permissions: ["https://www.omdbapi.com/*", "https://api.themoviedb.org/*"],
+    host_permissions: ["https://www.omdbapi.com/*"],
+  },
+  webExt: {
+    chromiumProfile: 'C:/Users/Karan/wxt-dev-profile',
+    keepProfileChanges: true,
   },
 });
