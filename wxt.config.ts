@@ -10,8 +10,4 @@ export default defineConfig({
     permissions: ["storage"],
     host_permissions: ["https://www.omdbapi.com/*"],
   },
-  webExt: {
-    chromiumProfile: 'C:/Users/Karan/wxt-dev-profile',
-    keepProfileChanges: true,
-  },
 });
