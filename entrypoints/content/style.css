@@ -1,5 +1,4 @@
-/* Rating badges injected into YouTube movie cards. Everything is prefixed with
-   "ymr-" so it can't collide with YouTube's own class names. */
+/* Badge styles. Everything starts with ymr- so it doesn't clash with YouTube's classes */
 
 .ymr-ratings {
   display: flex;
@@ -55,7 +54,7 @@
   color: #fff;
 }
 
-/* YouTube's own variable, so it follows light/dark theme automatically. */
+/* Uses YouTube's text color so it works in light and dark mode */
 .ymr-note {
   color: var(--yt-spec-text-secondary, #606060);
 }

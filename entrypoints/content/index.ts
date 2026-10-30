@@ -1,42 +1,51 @@
 import './style.css';
 import { API_KEY_STORAGE_KEY, type GetRatingsMessage, type Ratings, type RatingsResponse } from '@/utils/ratings';
+import type { RecordBatchMessage } from '@/utils/devStats';
 
 const MOVIE_SELECTOR = 'ytd-grid-movie-renderer';
 const TITLE_SELECTOR = '#video-title';
 const METADATA_SELECTOR = '.grid-movie-renderer-metadata';
 
 const BADGE_CLASS = 'ymr-ratings';
-// Stores the title a card was processed for, so we notice when YouTube reuses the card for another movie.
+// Holds the title the card was processed for. YouTube reuses cards, so if the title changes we redo it.
 const PROCESSED_ATTR = 'data-ratings-title';
 const SCAN_INTERVAL_MS = 500;
 const MAX_CONCURRENT_REQUESTS = 4;
+// How close a card has to get to the screen before we load its ratings
+const VISIBILITY_MARGIN = '300px 0px';
 
 type Movie = { title: string; year?: string };
 type BadgeState = RatingsResponse | { status: 'loading' };
+
+// Only look up cards that are on (or close to) the screen. Some pages have hundreds of cards
+// and fetching all of them eats through the 1,000 requests/day limit.
+// It gets created in main() since WXT also imports this file at build time, where it doesn't exist.
+let visibilityObserver: IntersectionObserver;
 
 export default defineContentScript({
   matches: ['*://*.youtube.com/*'],
   main(ctx) {
     console.log('Youtube Movie Ratings content script loaded');
-    findAndProcessMovies();
+    visibilityObserver = new IntersectionObserver(onCardsVisible, { rootMargin: VISIBILITY_MARGIN });
+    watchNewMovieCards();
 
-    // YouTube changes the DOM almost constantly, so a debounce might never fire.
-    // Throttle instead: scan at most once every SCAN_INTERVAL_MS while things are changing.
+    // YouTube changes the DOM pretty much constantly, so a debounce might never fire.
+    // Throttling instead so we scan at most once every SCAN_INTERVAL_MS.
     let scanScheduled = false;
     const observer = new MutationObserver(() => {
       if (scanScheduled) return;
       scanScheduled = true;
       ctx.setTimeout(() => {
         scanScheduled = false;
-        findAndProcessMovies();
+        watchNewMovieCards();
       }, SCAN_INTERVAL_MS);
     });
     observer.observe(document.body, { childList: true, subtree: true });
 
-    // YouTube fires this after every in-app (SPA) navigation.
-    document.addEventListener('yt-navigate-finish', findAndProcessMovies);
+    // YouTube fires this after navigating between pages
+    document.addEventListener('yt-navigate-finish', watchNewMovieCards);
 
-    // When the API key is added or changed in the popup, redo every card on the page.
+    // Redo all the cards if the API key changes
     const onStorageChanged = (changes: Record<string, unknown>, areaName: string) => {
       if (areaName === 'local' && API_KEY_STORAGE_KEY in changes) {
         reprocessAll();
@@ -44,16 +53,21 @@ export default defineContentScript({
     };
     browser.storage.onChanged.addListener(onStorageChanged);
 
-    // Clean up when the extension is reloaded or updated while the tab stays open.
+    // Clean up if the extension gets reloaded while the tab is still open
     ctx.onInvalidated(() => {
       observer.disconnect();
-      document.removeEventListener('yt-navigate-finish', findAndProcessMovies);
+      visibilityObserver.disconnect();
+      document.removeEventListener('yt-navigate-finish', watchNewMovieCards);
       browser.storage.onChanged.removeListener(onStorageChanged);
     });
   },
 });
 
-function findAndProcessMovies(): void {
+/**
+ * Finds movie cards that are new (or now show a different movie) and starts watching them,
+ * so their ratings get loaded once they're near the screen.
+ */
+function watchNewMovieCards(): void {
   const movieElements = document.querySelectorAll(MOVIE_SELECTOR);
   for (const element of movieElements) {
     const movie = extractMovie(element);
@@ -61,57 +75,115 @@ function findAndProcessMovies(): void {
     if (element.getAttribute(PROCESSED_ATTR) === movie.title) continue;
 
     element.setAttribute(PROCESSED_ATTR, movie.title);
+    // Remove the old badge in case the card was reused for a different movie
+    element.querySelector(`.${BADGE_CLASS}`)?.remove();
+    // Look it up once it's near the screen. observe() does nothing if we're already
+    // watching this card, otherwise onCardsVisible gets called right away.
+    visibilityObserver.observe(element);
+  }
+}
+
+/**
+ * Called by the IntersectionObserver when watched cards come near the screen.
+ * Queues a ratings lookup for each card that is now visible.
+ * @param entries
+ */
+function onCardsVisible(entries: IntersectionObserverEntry[]): void {
+  for (const entry of entries) {
+    if (!entry.isIntersecting) continue;
+    const element = entry.target;
+    visibilityObserver.unobserve(element);
+
+    // Skip it if the card got reused for a different movie in the meantime.
+    // The next scan will pick up the new title.
+    const movie = extractMovie(element);
+    if (!movie || element.getAttribute(PROCESSED_ATTR) !== movie.title) continue;
+
     renderBadge(element, { status: 'loading' });
     enqueue(() => processMovie(element, movie));
   }
 }
 
+/**
+ * Clears the processed flag on every card and scans again, so every card gets looked up again.
+ */
 function reprocessAll(): void {
   for (const element of document.querySelectorAll(`[${PROCESSED_ATTR}]`)) {
     element.removeAttribute(PROCESSED_ATTR);
   }
-  findAndProcessMovies();
+  watchNewMovieCards();
 }
 
-/** Reads the movie title and release year out of a YouTube movie card. */
+/**
+ * Gets the title and year from a movie card.
+ * @param element
+ * @returns the title and year, or null if the card doesn't have a title yet.
+ */
 function extractMovie(element: Element): Movie | null {
   const title = element.querySelector(TITLE_SELECTOR)?.getAttribute('title')?.trim();
   if (!title) return null;
 
-  // Metadata looks like "Drama • 2019"; grab the first 4-digit year in it.
+  // Metadata looks like "Drama • 2019" so just grab the year
   const metadata = element.querySelector(METADATA_SELECTOR)?.textContent ?? '';
   const year = metadata.match(/\b(19|20)\d{2}\b/)?.[0];
   return { title, year };
 }
 
+/**
+ * Asks the background script for the movie's ratings and shows them on the card.
+ * @param element
+ * @param movie
+ */
 async function processMovie(element: Element, movie: Movie): Promise<void> {
   const message: GetRatingsMessage = { type: 'GET_RATINGS', payload: movie };
   let response: RatingsResponse;
   try {
     response = await browser.runtime.sendMessage(message);
   } catch (error) {
-    // Usually means the extension was reloaded while this tab was open.
+    // Usually means the extension got reloaded and the page needs a refresh
     response = { status: 'error', message: 'Extension was reloaded. Refresh the page.' };
   }
   if (!response) {
     response = { status: 'error', message: 'No response from background worker' };
   }
 
-  // The card may have been reused for a different movie while we were waiting.
+  if (response.status === 'ok' || response.status === 'not_found') {
+    batchRatedCards++;
+  }
+
+  // Card might have been reused for a different movie while we were waiting
   if (element.getAttribute(PROCESSED_ATTR) !== movie.title) return;
   renderBadge(element, response);
 }
 
-// ---- Request queue: keeps us from firing 30+ OMDb requests at once on a full page ----
+
+// Limits how many lookups run at once so we don't flood OMDb
 
 const queue: (() => Promise<void>)[] = [];
 let activeRequests = 0;
 
+// A batch starts when the queue goes from empty to busy and ends when it's empty again.
+// Used for the timing numbers in the dev stats.
+let batchStart = 0;
+let batchRatedCards = 0;
+
+/**
+ * Adds a lookup to the queue and starts it if there's room.
+ * Also starts timing a new batch if the queue was empty.
+ * @param task
+ */
 function enqueue(task: () => Promise<void>): void {
+  if (activeRequests === 0 && queue.length === 0) {
+    batchStart = performance.now();
+    batchRatedCards = 0;
+  }
   queue.push(task);
   runQueue();
 }
 
+/**
+ * Starts queued lookups until MAX_CONCURRENT_REQUESTS are running.
+ */
 function runQueue(): void {
   while (activeRequests < MAX_CONCURRENT_REQUESTS && queue.length > 0) {
     const task = queue.shift()!;
@@ -119,12 +191,32 @@ function runQueue(): void {
     task().finally(() => {
       activeRequests--;
       runQueue();
+      if (activeRequests === 0 && queue.length === 0) {
+        reportBatch();
+      }
     });
   }
 }
 
-// ---- Badge rendering ----
+/**
+ * Sends how long the last batch took to the background script for the dev stats.
+ */
+function reportBatch(): void {
+  // Ignore batches where nothing actually got rated (like when there's no API key)
+  if (batchRatedCards === 0) return;
+  const message: RecordBatchMessage = {
+    type: 'RECORD_BATCH',
+    payload: { cards: batchRatedCards, ms: performance.now() - batchStart },
+  };
+  browser.runtime.sendMessage(message).catch(() => {});
+}
 
+
+/**
+ * Replaces the card's badge with one for the given state (loading, ratings, or a message).
+ * @param element
+ * @param state
+ */
 function renderBadge(element: Element, state: BadgeState): void {
   element.querySelector(`.${BADGE_CLASS}`)?.remove();
 
@@ -158,6 +250,11 @@ function renderBadge(element: Element, state: BadgeState): void {
   }
 }
 
+/**
+ * Adds the IMDb, RT and Metacritic pills to a badge, skipping any that are missing.
+ * @param badge
+ * @param ratings
+ */
 function appendRatingPills(badge: HTMLElement, ratings: Ratings): void {
   const rtScore = parseInt(ratings.rtRating, 10);
   const mcScore = parseInt(ratings.metacriticRating, 10);
@@ -175,7 +272,14 @@ function appendRatingPills(badge: HTMLElement, ratings: Ratings): void {
   }
 }
 
-/** Returns null when the rating is missing so we don't show empty "N/A" pills. */
+/**
+ * Creates one rating pill, like "IMDb 7.8".
+ * @param label
+ * @param value
+ * @param className
+ * @param tooltip
+ * @returns the pill element, or null if the rating is missing so we don't show "N/A" pills.
+ */
 function createPill(label: string, value: string, className: string, tooltip: string): HTMLElement | null {
   if (!value || value === 'N/A') return null;
 
@@ -191,13 +295,22 @@ function createPill(label: string, value: string, className: string, tooltip: st
   return pill;
 }
 
-/** Same thresholds Metacritic uses for its green/yellow/red colors. */
+/**
+ * Picks the pill color for a Metacritic score, using the same cutoffs Metacritic uses.
+ * @param score
+ * @returns the CSS class name.
+ */
 function metacriticClass(score: number): string {
   if (score >= 61) return 'ymr-mc-good';
   if (score >= 40) return 'ymr-mc-mixed';
   return 'ymr-mc-bad';
 }
 
+/**
+ * Creates a plain text note for the badge, like "No ratings found".
+ * @param text
+ * @returns the note element.
+ */
 function createNote(text: string): HTMLElement {
   const note = document.createElement('span');
   note.className = 'ymr-note';

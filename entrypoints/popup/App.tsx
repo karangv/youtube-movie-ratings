@@ -1,8 +1,12 @@
 import { useEffect, useState } from 'react';
 import { API_KEY_STORAGE_KEY, CACHE_PREFIX } from '@/utils/ratings';
+import DevStats from './DevStats';
 
 type Status = { kind: 'idle' | 'info' | 'success' | 'error'; text: string };
 
+/**
+ * Popup for saving the OMDb API key and managing the cache.
+ */
 function App() {
   const [apiKey, setApiKey] = useState('');
   const [status, setStatus] = useState<Status>({ kind: 'idle', text: '' });
@@ -43,7 +47,7 @@ function App() {
       return;
     }
 
-    // Save the API key to storage. Open YouTube tabs pick this up automatically.
+    // Save the API key to storage (open YouTube tabs update on their own)
     await browser.storage.local.set({ [API_KEY_STORAGE_KEY]: trimmedKey });
     setApiKey(trimmedKey);
     setStatus({ kind: 'success', text: 'API key saved. Ratings will show on YouTube movie pages.' });
@@ -92,17 +96,20 @@ function App() {
           Clear cache
         </button>
       </div>
+
+      <DevStats />
     </div>
   );
 }
 
 /**
- * Makes one cheap OMDb request to check the key works.
- * @returns an error message, or null if the key is valid.
+ * Checks the API key with a quick OMDb request.
+ * @param apiKey 
+ * @returns an error message, or null if the key works.
  */
 async function validateApiKey(apiKey: string): Promise<string | null> {
   try {
-    // tt0111161 = The Shawshank Redemption; any known IMDb id works.
+    // tt0111161 is The Shawshank Redemption, any valid IMDb id would work
     const response = await fetch(`https://www.omdbapi.com/?i=tt0111161&apikey=${encodeURIComponent(apiKey)}`);
     const data = await response.json();
     if (data.Response === 'True') return null;
