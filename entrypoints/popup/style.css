@@ -91,6 +91,9 @@ hr {
   justify-content: space-between;
   color: var(--muted);
 }
+.cache + .cache {
+  margin-top: 8px;
+}
 
 .dev-stats {
   margin-top: 12px;
@@ -100,6 +103,21 @@ hr {
 .dev-stats summary {
   cursor: pointer;
   user-select: none;
+}
+.dev-stats .algorithm {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+.dev-stats select {
+  font: inherit;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  color: inherit;
 }
 .dev-stats table {
   width: 100%;

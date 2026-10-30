@@ -27,3 +27,6 @@ web-ext.config.ts
 
 # Personal notes
 project-context.md
+
+# Exported votes (personal viewing data)
+votes*.json

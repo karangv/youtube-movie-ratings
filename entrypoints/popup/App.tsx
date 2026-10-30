@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { API_KEY_STORAGE_KEY, CACHE_PREFIX } from '@/utils/ratings';
+import { RECOMMENDATIONS_KEY, type RecommendationStore } from '@/utils/recommendations';
 import DevStats from './DevStats';
 
 type Status = { kind: 'idle' | 'info' | 'success' | 'error'; text: string };
@@ -12,6 +13,7 @@ function App() {
   const [status, setStatus] = useState<Status>({ kind: 'idle', text: '' });
   const [saving, setSaving] = useState(false);
   const [cachedCount, setCachedCount] = useState(0);
+  const [voteCounts, setVoteCounts] = useState({ up: 0, down: 0 });
 
   useEffect(() => {
     // Load the API key from storage when the component mounts
@@ -24,11 +26,22 @@ function App() {
       }
     });
     refreshCacheCount();
+    refreshVoteCounts();
   }, []);
 
   const refreshCacheCount = async () => {
     const all = await browser.storage.local.get(null);
     setCachedCount(Object.keys(all).filter((key) => key.startsWith(CACHE_PREFIX)).length);
+  };
+
+  const refreshVoteCounts = async () => {
+    const result = await browser.storage.local.get(RECOMMENDATIONS_KEY);
+    const store = result[RECOMMENDATIONS_KEY] as RecommendationStore | undefined;
+    const allVotes = Object.values(store?.votes ?? {});
+    setVoteCounts({
+      up: allVotes.filter((entry) => entry.vote === 1).length,
+      down: allVotes.filter((entry) => entry.vote === -1).length,
+    });
   };
 
   const handleSave = async () => {
@@ -58,6 +71,12 @@ function App() {
     const cacheKeys = Object.keys(all).filter((key) => key.startsWith(CACHE_PREFIX));
     await browser.storage.local.remove(cacheKeys);
     await refreshCacheCount();
+  };
+
+  const handleResetRecommendations = async () => {
+    // Open YouTube tabs see this change and remove their "For you" pills
+    await browser.storage.local.remove(RECOMMENDATIONS_KEY);
+    await refreshVoteCounts();
   };
 
   return (
@@ -94,6 +113,15 @@ function App() {
         </span>
         <button onClick={handleClearCache} disabled={cachedCount === 0}>
           Clear cache
+        </button>
+      </div>
+
+      <div className="row cache">
+        <span>
+          {voteCounts.up} 👍 · {voteCounts.down} 👎
+        </span>
+        <button onClick={handleResetRecommendations} disabled={voteCounts.up + voteCounts.down === 0}>
+          Reset recommendations
         </button>
       </div>
 

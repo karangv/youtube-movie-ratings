@@ -1,5 +1,6 @@
 // Counters for the "Developer stats" section in the popup.
 // Only the background script writes these, the popup just reads and resets them.
+import type { PillSource } from './recommendations';
 
 export const DEV_STATS_KEY = 'devStats';
 
@@ -32,11 +33,28 @@ export interface DevStats {
   batchMsTotal: number;
   slowestBatchMs: number;
   slowestBatchCards: number;
+
+  // Recommendations. Votes on cards with a "For you" pill are split by what put it there (an algorithm
+  // or the random control), so the 👍 rate can be compared between them and against cards without a pill.
+  forYou: Record<PillSource, ForYouStats>;
+  otherVotesUp: number;
+  otherVotesDown: number;
+}
+
+export interface ForYouStats {
+  shown: number; // different movies that got a "For you" pill
+  votesUp: number;
+  votesDown: number;
 }
 
 export interface RecordBatchMessage {
   type: 'RECORD_BATCH';
   payload: { cards: number; ms: number };
+}
+
+export interface RecordForYouMessage {
+  type: 'RECORD_FOR_YOU';
+  payload: { source: PillSource };
 }
 
 /**
@@ -64,5 +82,23 @@ export function emptyDevStats(): DevStats {
     batchMsTotal: 0,
     slowestBatchMs: 0,
     slowestBatchCards: 0,
+    forYou: {
+      cosine: { shown: 0, votesUp: 0, votesDown: 0 },
+      naiveBayes: { shown: 0, votesUp: 0, votesDown: 0 },
+      random: { shown: 0, votesUp: 0, votesDown: 0 },
+    },
+    otherVotesUp: 0,
+    otherVotesDown: 0,
   };
+}
+
+/**
+ * Fills in any fields missing from saved stats, like ones added in a newer version.
+ * The forYou groups are filled in too, since a plain spread would only fill in the top level.
+ * @param stored
+ * @returns complete stats.
+ */
+export function normalizeDevStats(stored: Partial<DevStats> | undefined): DevStats {
+  const empty = emptyDevStats();
+  return { ...empty, ...stored, forYou: { ...empty.forYou, ...stored?.forYou } };
 }

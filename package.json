@@ -12,6 +12,8 @@
     "zip": "wxt zip",
     "zip:firefox": "wxt zip -b firefox",
     "compile": "tsc --noEmit",
+    "test:recs": "node --experimental-strip-types scripts/test-recommendations.ts",
+    "eval:recs": "node --experimental-strip-types scripts/evaluate-recommendations.ts",
     "postinstall": "wxt prepare"
   },
   "dependencies": {

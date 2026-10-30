@@ -1,12 +1,26 @@
 import {
   API_KEY_STORAGE_KEY,
+  CACHE_KEY_PREFIX,
   CACHE_PREFIX,
   type CacheEntry,
   type GetRatingsMessage,
+  type MovieInfo,
   type Ratings,
   type RatingsResponse,
 } from '@/utils/ratings';
-import { DEV_STATS_KEY, emptyDevStats, type DevStats, type RecordBatchMessage } from '@/utils/devStats';
+import {
+  DEV_STATS_KEY,
+  normalizeDevStats,
+  type DevStats,
+  type RecordBatchMessage,
+  type RecordForYouMessage,
+} from '@/utils/devStats';
+import {
+  RECOMMENDATIONS_KEY,
+  emptyRecommendationStore,
+  type RateMovieMessage,
+  type RecommendationStore,
+} from '@/utils/recommendations';
 
 const FOUND_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 const NOT_FOUND_TTL_MS = 24 * 60 * 60 * 1000; // 1 day so misses get retried sooner
@@ -25,6 +39,15 @@ export default defineBackground(() => {
       recordBatch(message as RecordBatchMessage);
       return false;
     }
+    if (message?.type === 'RECORD_FOR_YOU') {
+      const { source } = (message as RecordForYouMessage).payload;
+      recordStats((stats) => stats.forYou[source].shown++);
+      return false;
+    }
+    if (message?.type === 'RATE_MOVIE') {
+      handleRateMovie(message as RateMovieMessage);
+      return false;
+    }
     if (message?.type !== 'GET_RATINGS') return false;
 
     handleGetRatings(message as GetRatingsMessage)
@@ -32,7 +55,24 @@ export default defineBackground(() => {
       .catch((error) => sendResponse({ status: 'error', message: String(error) }));
     return true;
   });
+
+  // Runs when the extension is installed or updated
+  browser.runtime.onInstalled.addListener(() => {
+    removeOldCacheEntries();
+  });
 });
+
+/**
+ * Deletes cache entries from older versions of the cache format so they don't sit in storage forever.
+ */
+async function removeOldCacheEntries(): Promise<void> {
+  const all = await browser.storage.local.get(null);
+  const oldKeys = Object.keys(all).filter((key) => key.startsWith(CACHE_PREFIX) && !key.startsWith(CACHE_KEY_PREFIX));
+  if (oldKeys.length > 0) {
+    await browser.storage.local.remove(oldKeys);
+    console.log(`Removed ${oldKeys.length} old cache entries`);
+  }
+}
 
 /**
  * Handles a GET_RATINGS message. Checks the cache first and only calls OMDb
@@ -50,7 +90,7 @@ async function handleGetRatings(message: GetRatingsMessage): Promise<RatingsResp
 
   const { title, year } = message.payload;
   const cleanedTitle = cleanTitle(title);
-  const cacheKey = `${CACHE_PREFIX}${cleanedTitle.toLowerCase()}_${year ?? ''}`;
+  const cacheKey = `${CACHE_KEY_PREFIX}${cleanedTitle.toLowerCase()}_${year ?? ''}`;
 
   const cachedResult = await browser.storage.local.get(cacheKey);
   const cached = cachedResult[cacheKey] as CacheEntry | undefined;
@@ -63,7 +103,9 @@ async function handleGetRatings(message: GetRatingsMessage): Promise<RatingsResp
         stats.cacheHits++;
         stats.cachedLookupMsTotal += elapsed;
       });
-      return cached.ratings ? { status: 'ok', ratings: cached.ratings } : { status: 'not_found' };
+      return cached.ratings && cached.info
+        ? { status: 'ok', ratings: cached.ratings, info: cached.info }
+        : { status: 'not_found' };
     }
   }
 
@@ -102,6 +144,7 @@ async function fetchAndCache(cacheKey: string, title: string, year: string | und
   if (response.status === 'ok' || response.status === 'not_found') {
     const entry: CacheEntry = {
       ratings: response.status === 'ok' ? response.ratings : null,
+      info: response.status === 'ok' ? response.info : null,
       cachedAt: Date.now(),
     };
     await browser.storage.local.set({ [cacheKey]: entry });
@@ -157,7 +200,7 @@ async function fetchMovieRatings(title: string, year: string | undefined, omdbAp
           if (index > 0) stats.foundViaFallback++;
           if (Object.values(ratings).every((value) => value !== 'N/A')) stats.foundWithAllRatings++;
         });
-        return { status: 'ok', ratings };
+        return { status: 'ok', ratings, info: getMovieInfo(omdbData) };
       }
       // Retrying won't help with a bad key or hitting the rate limit
       if (omdbData.Error !== 'Movie not found!') {
@@ -208,25 +251,89 @@ function getRatings(omdbData: any): Ratings {
   return { imdbRating, rtRating, metacriticRating };
 }
 
-// Dev stats
+/**
+ * Pulls the details used for recommendations out of OMDB data.
+ * OMDb gives lists as comma separated strings like "Action, Crime, Drama", or 'N/A' when missing.
+ * @param omdbData
+ * @returns the movie's IMDb id, genres, directors, actors and year.
+ */
+function getMovieInfo(omdbData: any): MovieInfo {
+  const toList = (value: string | undefined) =>
+    !value || value === 'N/A' ? [] : value.split(',').map((item) => item.trim()).filter(Boolean);
+  const year = parseInt(omdbData.Year, 10);
+  return {
+    imdbId: omdbData.imdbID,
+    genres: toList(omdbData.Genre),
+    directors: toList(omdbData.Director),
+    actors: toList(omdbData.Actors),
+    year: isNaN(year) ? undefined : year,
+  };
+}
 
-// Each update reads the stats, changes them and saves them back, so updates have to run
-// one at a time. Otherwise two updates landing together would overwrite each other.
-let statsQueue: Promise<void> = Promise.resolve();
+// Recommendations
 
 /**
- * Queues an update to the dev stats. Updates run one at a time so they don't overwrite each other.
+ * Saves (or removes, when vote is 0) the user's thumbs up/down for a movie.
+ * @param message
+ */
+function handleRateMovie(message: RateMovieMessage): void {
+  const { title, info, ratings, vote, forYouSource } = message.payload;
+  const normalizeStore = (stored: Partial<RecommendationStore> | undefined) => ({ ...emptyRecommendationStore(), ...stored });
+  queueUpdate(RECOMMENDATIONS_KEY, normalizeStore, (store) => {
+    if (vote === 0) {
+      delete store.votes[info.imdbId];
+    } else {
+      store.votes[info.imdbId] = { vote, title, info, ratings, votedAt: Date.now() };
+    }
+  });
+
+  if (vote === 0) return;
+  recordStats((stats) => {
+    if (forYouSource) {
+      const forYou = stats.forYou[forYouSource];
+      vote === 1 ? forYou.votesUp++ : forYou.votesDown++;
+    } else {
+      vote === 1 ? stats.otherVotesUp++ : stats.otherVotesDown++;
+    }
+  });
+}
+
+// Saving to storage
+
+// Each update reads a value, changes it and saves it back, so updates have to run
+// one at a time. Otherwise two updates landing together would overwrite each other.
+let storageQueue: Promise<void> = Promise.resolve();
+
+/**
+ * Queues a read-change-save update to one storage key. Updates run one at a time.
+ * normalize fills in missing fields, so adding a new field later doesn't break old saved data.
+ * @param key
+ * @param normalize
+ * @param update
+ */
+function queueUpdate<T extends object>(
+  key: string,
+  normalize: (stored: Partial<T> | undefined) => T,
+  update: (value: T) => void,
+): void {
+  storageQueue = storageQueue
+    .then(async () => {
+      const result = await browser.storage.local.get(key);
+      const value = normalize(result[key] as Partial<T> | undefined);
+      update(value);
+      await browser.storage.local.set({ [key]: value });
+    })
+    .catch((error) => console.error(`Failed to update ${key}:`, error));
+}
+
+// Dev stats
+
+/**
+ * Queues an update to the dev stats.
  * @param update
  */
 function recordStats(update: (stats: DevStats) => void): void {
-  statsQueue = statsQueue
-    .then(async () => {
-      const result = await browser.storage.local.get(DEV_STATS_KEY);
-      const stats = (result[DEV_STATS_KEY] as DevStats | undefined) ?? emptyDevStats();
-      update(stats);
-      await browser.storage.local.set({ [DEV_STATS_KEY]: stats });
-    })
-    .catch((error) => console.error('Failed to record dev stats:', error));
+  queueUpdate(DEV_STATS_KEY, normalizeDevStats, update);
 }
 
 /**

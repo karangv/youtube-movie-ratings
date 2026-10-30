@@ -1,6 +1,20 @@
 import './style.css';
 import { API_KEY_STORAGE_KEY, type GetRatingsMessage, type Ratings, type RatingsResponse } from '@/utils/ratings';
-import type { RecordBatchMessage } from '@/utils/devStats';
+import type { RecordBatchMessage, RecordForYouMessage } from '@/utils/devStats';
+import {
+  ALGORITHM_KEY,
+  DEFAULT_ALGORITHM,
+  RECOMMENDATIONS_KEY,
+  forYouSource,
+  trainModel,
+  type Algorithm,
+  type Model,
+  type PillSource,
+  type RateMovieMessage,
+  type RecommendationStore,
+  type Vote,
+  type VoteEntry,
+} from '@/utils/recommendations';
 
 const MOVIE_SELECTOR = 'ytd-grid-movie-renderer';
 const TITLE_SELECTOR = '#video-title';
@@ -16,6 +30,15 @@ const VISIBILITY_MARGIN = '300px 0px';
 
 type Movie = { title: string; year?: string };
 type BadgeState = RatingsResponse | { status: 'loading' };
+type RatedResponse = Extract<RatingsResponse, { status: 'ok' }>;
+
+// The user's votes and the model trained on them. Kept in sync with storage.
+let votes: Record<string, VoteEntry> = {};
+let model: Model = trainModel(DEFAULT_ALGORITHM, []);
+// Ratings for each card, so badges can be redrawn when the votes change without looking them up again
+const cardResults = new WeakMap<Element, { title: string; response: RatedResponse }>();
+// Movies already counted in the dev stats as getting a "For you" pill
+const reportedForYou = new Set<string>();
 
 // Only look up cards that are on (or close to) the screen. Some pages have hundreds of cards
 // and fetching all of them eats through the 1,000 requests/day limit.
@@ -27,6 +50,7 @@ export default defineContentScript({
   main(ctx) {
     console.log('Youtube Movie Ratings content script loaded');
     visibilityObserver = new IntersectionObserver(onCardsVisible, { rootMargin: VISIBILITY_MARGIN });
+    loadRecommendations().then(refreshBadges);
     watchNewMovieCards();
 
     // YouTube changes the DOM pretty much constantly, so a debounce might never fire.
@@ -45,10 +69,14 @@ export default defineContentScript({
     // YouTube fires this after navigating between pages
     document.addEventListener('yt-navigate-finish', watchNewMovieCards);
 
-    // Redo all the cards if the API key changes
+    // Redo all the cards if the API key changes, and redraw the badges if the votes or algorithm change
     const onStorageChanged = (changes: Record<string, unknown>, areaName: string) => {
-      if (areaName === 'local' && API_KEY_STORAGE_KEY in changes) {
+      if (areaName !== 'local') return;
+      if (API_KEY_STORAGE_KEY in changes) {
         reprocessAll();
+      }
+      if (RECOMMENDATIONS_KEY in changes || ALGORITHM_KEY in changes) {
+        loadRecommendations().then(refreshBadges);
       }
     };
     browser.storage.onChanged.addListener(onStorageChanged);
@@ -153,6 +181,9 @@ async function processMovie(element: Element, movie: Movie): Promise<void> {
 
   // Card might have been reused for a different movie while we were waiting
   if (element.getAttribute(PROCESSED_ATTR) !== movie.title) return;
+  if (response.status === 'ok') {
+    cardResults.set(element, { title: movie.title, response });
+  }
   renderBadge(element, response);
 }
 
@@ -227,9 +258,16 @@ function renderBadge(element: Element, state: BadgeState): void {
     case 'loading':
       badge.append(createNote('Loading ratings…'));
       break;
-    case 'ok':
+    case 'ok': {
+      const source = pillSourceFor(state);
+      if (source) {
+        badge.append(createForYouPill());
+        reportForYou(source, state.info.imdbId);
+      }
       appendRatingPills(badge, state.ratings);
+      badge.append(createVoteButtons(element, state, source));
       break;
+    }
     case 'not_found':
       badge.append(createNote('No ratings found'));
       break;
@@ -316,4 +354,132 @@ function createNote(text: string): HTMLElement {
   note.className = 'ymr-note';
   note.textContent = text;
   return note;
+}
+
+// Recommendations
+
+/**
+ * Loads the user's votes and chosen algorithm from storage and retrains the model.
+ */
+async function loadRecommendations(): Promise<void> {
+  const result = await browser.storage.local.get([RECOMMENDATIONS_KEY, ALGORITHM_KEY]);
+  const store = result[RECOMMENDATIONS_KEY] as RecommendationStore | undefined;
+  const algorithm = (result[ALGORITHM_KEY] as Algorithm | undefined) ?? DEFAULT_ALGORITHM;
+  votes = store?.votes ?? {};
+  model = trainModel(algorithm, Object.values(votes));
+}
+
+/**
+ * Redraws the badge on every card that already has ratings, like after the votes change.
+ */
+function refreshBadges(): void {
+  for (const element of document.querySelectorAll(`[${PROCESSED_ATTR}]`)) {
+    const result = cardResults.get(element);
+    // Skip cards that got reused for a different movie since they were rated
+    if (!result || element.getAttribute(PROCESSED_ATTR) !== result.title) continue;
+    renderBadge(element, result.response);
+  }
+}
+
+/**
+ * Checks if a movie should get a "For you" pill. Movies the user already voted on never do.
+ * @param state
+ * @returns what put the pill there (an algorithm or the random control), or null for no pill.
+ */
+function pillSourceFor(state: RatedResponse): PillSource | null {
+  if (votes[state.info.imdbId]) return null;
+  try {
+    return forYouSource(model, state.info, state.ratings);
+  } catch (error) {
+    // A bug in the scoring shouldn't break the ratings badges
+    console.error('Scoring failed:', error);
+    return null;
+  }
+}
+
+/**
+ * Creates the "For you" pill shown on recommended movies.
+ * @returns the pill element.
+ */
+function createForYouPill(): HTMLElement {
+  const pill = document.createElement('span');
+  pill.className = 'ymr-pill ymr-for-you';
+  pill.textContent = 'For you';
+  pill.title = 'Recommended based on your 👍/👎 votes';
+  return pill;
+}
+
+/**
+ * Counts a movie in the dev stats the first time it gets a "For you" pill on this page.
+ * @param source
+ * @param imdbId
+ */
+function reportForYou(source: PillSource, imdbId: string): void {
+  const key = `${source}:${imdbId}`;
+  if (reportedForYou.has(key)) return;
+  reportedForYou.add(key);
+  const message: RecordForYouMessage = { type: 'RECORD_FOR_YOU', payload: { source } };
+  browser.runtime.sendMessage(message).catch(() => {});
+}
+
+/**
+ * Creates the 👍/👎 buttons for a card. The button matching the current vote shows as pressed.
+ * @param element
+ * @param state
+ * @param source
+ * @returns the element holding both buttons.
+ */
+function createVoteButtons(element: Element, state: RatedResponse, source: PillSource | null): HTMLElement {
+  const current = votes[state.info.imdbId]?.vote ?? 0;
+  const wrapper = document.createElement('span');
+  wrapper.className = 'ymr-votes';
+
+  const options: [Vote, string, string][] = [
+    [1, '👍', 'I liked this'],
+    [-1, '👎', "I didn't like this"],
+  ];
+  for (const [vote, emoji, label] of options) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'ymr-vote';
+    button.textContent = emoji;
+    button.title = `${label} (used for recommendations)`;
+    button.setAttribute('aria-label', label);
+    button.setAttribute('aria-pressed', String(current === vote));
+
+    // The badge sits inside YouTube's clickable card, so stop the click from also opening the movie
+    button.addEventListener('mousedown', (event) => event.stopPropagation());
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      // Clicking the thumb that's already pressed undoes the vote
+      castVote(element, state, current === vote ? 0 : vote, source);
+    });
+    wrapper.append(button);
+  }
+  return wrapper;
+}
+
+/**
+ * Saves a vote and redraws the card right away. A vote of 0 removes the vote.
+ * @param element
+ * @param state
+ * @param vote
+ * @param forYouSource what put a "For you" pill on the card, or null if it didn't have one
+ */
+function castVote(element: Element, state: RatedResponse, vote: Vote | 0, forYouSource: PillSource | null): void {
+  const { info, ratings } = state;
+  const title = element.getAttribute(PROCESSED_ATTR) ?? '';
+
+  // Update locally first so the button reacts instantly. Once the background saves it,
+  // the storage change retrains the model and redraws every card.
+  if (vote === 0) {
+    delete votes[info.imdbId];
+  } else {
+    votes[info.imdbId] = { vote, title, info, ratings, votedAt: Date.now() };
+  }
+  renderBadge(element, state);
+
+  const message: RateMovieMessage = { type: 'RATE_MOVIE', payload: { title, info, ratings, vote, forYouSource } };
+  browser.runtime.sendMessage(message).catch(() => {});
 }
